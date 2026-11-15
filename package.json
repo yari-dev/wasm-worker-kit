@@ -1,0 +1,15 @@
+{
+	"name": "wasm-worker-kit",
+	"version": "1.0.0",
+	"private": true,
+	"description": "Browser-executed WASM job queue for WordPress plugins.",
+	"license": "MIT",
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"demo": "node tools/vendor.mjs --to examples/demo-plugin/lib/wasm-worker --namespace \"WwDemo\\Worker\"",
+		"test": "node tests/worker.test.mjs"
+	}
+}

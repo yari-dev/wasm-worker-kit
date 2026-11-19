@@ -247,8 +247,9 @@ export function startWorkers( options ) {
  * Background helper: polls the amount of waiting work and starts this tab's workers when there is some
  * and no other tab of the browser works. The workers stop after about half a minute without work.
  *
- * @param {Object} options          Same as `startWorkers()`.
- * @param {number} options.interval Polling interval in ms. Default 60000.
+ * @param {Object}   options          Same as `startWorkers()`.
+ * @param {number}   options.interval Polling interval in ms. Default 60000.
+ * @param {string[]} options.types    Task types this tab's worker runs: only their work wakes it. Default: all.
  * @return {{stop: Function, workers: Object}}
  */
 export function watchQueue( options ) {
@@ -262,7 +263,10 @@ export function watchQueue( options ) {
 		}
 
 		try {
-			const response = await fetch( config.restUrl + 'waiting', { credentials: 'same-origin', headers: { 'X-WP-Nonce': config.nonce } } );
+			// The address may already have a query (plain permalinks: ?rest_route=/ns/).
+			const query = Array.isArray( config.types ) && config.types.length ? config.types.map( ( type ) => `types[]=${ encodeURIComponent( type ) }` ).join( '&' ) : '';
+			const url = config.restUrl + 'waiting' + ( query ? ( config.restUrl.includes( '?' ) ? '&' : '?' ) + query : '' );
+			const response = await fetch( url, { credentials: 'same-origin', headers: { 'X-WP-Nonce': config.nonce } } );
 			if ( 403 === response.status ) {
 				await renewNonce( config );
 				return;

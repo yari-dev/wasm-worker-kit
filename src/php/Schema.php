@@ -17,7 +17,7 @@ final class Schema {
 	/**
 	 * Schema version of this kit release.
 	 */
-	const VERSION = 3;
+	const VERSION = 4;
 
 	/** @var string */
 	public $jobs;
@@ -61,6 +61,7 @@ final class Schema {
   planned tinyint(1) unsigned NOT NULL DEFAULT 0,
   plan_cursor text NULL,
   plan_wait tinyint(1) unsigned NOT NULL DEFAULT 0,
+  finalize_tries smallint(5) unsigned NOT NULL DEFAULT 0,
   depends_on text NULL,
   group_key varchar(64) NOT NULL DEFAULT '',
   affinity varchar(64) NOT NULL DEFAULT '',

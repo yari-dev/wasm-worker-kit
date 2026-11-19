@@ -43,6 +43,12 @@ if ( ! isMainThread ) {
 					return new Promise( ( resolve, reject ) => ctx.signal.addEventListener( 'abort', () => reject( new Error( 'aborted' ) ) ) );
 				},
 			},
+			up: {
+				async run( ctx ) {
+					const receipt = await ctx.upload( 'file.bin', new Uint8Array( [ 1, 2, 3 ] ) );
+					return receipt.key;
+				},
+			},
 			pair: {
 				runBatch( ctx ) {
 					ctx.progress( 0.5 );
@@ -59,11 +65,12 @@ if ( ! isMainThread ) {
 		failures += ok ? 0 : 1;
 	};
 
-	// Fake server: two batches (one per runner style), one stopped mid-way, then nothing.
-	const seen = { claims: [], completes: [], fails: [], releases: [] };
+	// Fake server: two batches (one per runner style), one that uploads, one stopped mid-way, then nothing.
+	const seen = { claims: [], completes: [], fails: [], releases: [], artifacts: [] };
 	const batches = [
 		{ lease: 'a'.repeat( 64 ), type: 'add', affinity: 'nl-en', ttl: 60, units: [ { id: 1, epoch: 1, key: 'u1', job_id: 7, attempt: 1, input: { a: 1, b: 2 } }, { id: 2, epoch: 1, key: 'u2', job_id: 7, attempt: 2, input: { kind: 'bad' } } ] },
 		{ lease: 'b'.repeat( 64 ), type: 'pair', affinity: 'de-en', ttl: 60, units: [ { id: 3, epoch: 1, key: 'p1', job_id: 8, input: { a: 5 } }, { id: 4, epoch: 1, key: 'p2', job_id: 8, input: { fail: true } }, { id: 5, epoch: 1, key: 'p3', job_id: 8, input: { a: 7 } } ] },
+		{ lease: 'd'.repeat( 64 ), type: 'up', ttl: 60, units: [ { id: 20, epoch: 1, key: 'f1', job_id: 10, input: {} } ] },
 		{ lease: 'c'.repeat( 64 ), type: 'slow', ttl: 60, units: [ { id: 6, epoch: 3, key: 's1', job_id: 9, input: { a: 1 } }, { id: 7, epoch: 3, key: 's2', job_id: 9, input: { wait: true } }, { id: 8, epoch: 4, key: 's3', job_id: 9, input: { a: 3 } } ] },
 	];
 	const server = http.createServer( async ( req, res ) => {
@@ -71,7 +78,8 @@ if ( ! isMainThread ) {
 		for await ( const chunk of req ) {
 			body += chunk;
 		}
-		const data = body ? JSON.parse( body ) : {};
+		// An upload is multipart, not JSON.
+		const data = body && ( req.headers[ 'content-type' ] || '' ).startsWith( 'application/json' ) ? JSON.parse( body ) : {};
 		const route = req.url.split( '/' ).pop();
 		const send = ( value ) => {
 			res.writeHead( 200, { 'Content-Type': 'application/json' } );
@@ -93,6 +101,15 @@ if ( ! isMainThread ) {
 		if ( 'release' === route ) {
 			seen.releases.push( data );
 			return send( { released: data.units.map( ( u ) => u.unit_id ) } );
+		}
+		if ( 'artifact' === route ) {
+			seen.artifacts.push( req.headers[ 'content-type' ] || '' );
+			if ( 1 === seen.artifacts.length ) {
+				// The server is down for the first upload: the worker sends it again.
+				res.writeHead( 503, { 'Content-Type': 'application/json' } );
+				return res.end( JSON.stringify( { code: 'down', message: 'down' } ) );
+			}
+			return send( { key: 'file.bin', size: 3, sha256: 'x' } );
 		}
 		if ( 'echo' === route ) {
 			return send( { auth: req.headers.authorization || req.headers[ 'x-wp-nonce' ] || '' } );
@@ -126,7 +143,7 @@ if ( ! isMainThread ) {
 		return test();
 	};
 
-	await until( () => seen.completes.length >= 2 && seen.claims.length >= 3 && statuses.some( ( s ) => 'working' === s.state && 's2' === s.unit ) );
+	await until( () => seen.completes.length >= 3 && seen.claims.length >= 4 && statuses.some( ( s ) => 'working' === s.state && 's2' === s.unit ) );
 
 	const first = seen.completes[ 0 ];
 	check( 1 === first.results.length && 103 === first.results[ 0 ].result.sum, 'run(): result accepted, prepare() got the host options' );
@@ -140,6 +157,10 @@ if ( ! isMainThread ) {
 	check( statuses.some( ( s ) => 'custom' === s.state && 'add' === s.task && 'u1' === s.unit ), 'report() posts a custom status with the task type' );
 	check( statuses.some( ( s ) => 'working' === s.state && 'add' === s.task ) && statuses.some( ( s ) => 'completed' === s.state && 'pair' === s.task ), 'statuses keep their type (working, completed)' );
 	check( statuses.some( ( s ) => 'progress' === s.state && 'pair' === s.task && 0.5 === s.fraction ), 'batch progress' );
+
+	const third = seen.completes[ 2 ] || { results: [] };
+	check( 2 === seen.artifacts.length && seen.artifacts.every( ( type ) => type.startsWith( 'multipart/form-data' ) ), 'upload(): a failed upload (503) is sent again' );
+	check( 1 === third.results.length && 20 === third.results[ 0 ].unit_id && 'file.bin' === third.results[ 0 ].result, 'upload(): the unit completes with the receipt of the second attempt' );
 
 	// Direct runs.
 	thread.postMessage( { type: 'run', id: 1, task: 'pair', inputs: [ { a: 2 }, { fail: true } ] } );
@@ -157,7 +178,7 @@ if ( ! isMainThread ) {
 	await until( () => seen.releases.length >= 1 && null === leases[ leases.length - 1 ].lease );
 	const release = seen.releases[ 0 ] || {};
 	check( 'c'.repeat( 64 ) === release.lease && '7/3,8/4' === ( release.units || [] ).map( ( u ) => `${ u.unit_id }/${ u.epoch }` ).join(), 'stop(): the unfinished units of the batch are released' );
-	check( 3 === seen.completes.length && 6 === seen.completes[ 2 ].results[ 0 ].unit_id && 1 === seen.completes[ 2 ].results.length, 'stop(): the finished unit is submitted, not released' );
+	check( 4 === seen.completes.length && 6 === seen.completes[ 3 ].results[ 0 ].unit_id && 1 === seen.completes[ 3 ].results.length, 'stop(): the finished unit is submitted, not released' );
 	check( 1 === seen.releases.length && null === leases[ leases.length - 1 ].lease, 'stop(): one release, then the page is told nothing is held' );
 	await thread.terminate();
 	server.close();

@@ -469,7 +469,21 @@ export function serve( { runners } ) {
 				form.append( 'key', key );
 				form.append( 'sha256', await sha256( await blob.arrayBuffer() ) );
 				form.append( 'file', blob, key.split( '/' ).pop() );
-				return api( 'artifact', form );
+
+				// Network errors, server errors and a damaged transfer are retried: the server keeps one file per
+				// key, so sending it again is safe. A lost lease, a refused file or a stop is final.
+				for ( let attempt = 0; ; attempt++ ) {
+					signal.throwIfAborted();
+					try {
+						return await api( 'artifact', form );
+					} catch ( error ) {
+						const again = ! error.status || error.status >= 500 || 422 === error.status || 429 === error.status;
+						if ( ! again || attempt >= 3 || signal.aborted ) {
+							throw error;
+						}
+						await sleep( 1000 * 2 ** attempt );
+					}
+				}
 			},
 
 			progress( fraction, text = '' ) {

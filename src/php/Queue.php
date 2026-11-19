@@ -96,16 +96,18 @@ final class Queue {
 	/** Returns an option of a task type, validated. */
 	public function option( string $type, string $name ) {
 		$defaults = array(
-			'lease_seconds' => 120,
-			'max_attempts'  => 3,
-			'backoff'       => 10,
-			'max_runtime'   => 0,
-			'batch_units'   => 1,
-			'batch_cost'    => 0,
-			'max_leased'    => 0,
-			'rate_limit'    => array(),
-			'priority'      => 0,
-			'on_failure'    => 'continue',
+			'lease_seconds'     => 120,
+			'max_attempts'      => 3,
+			'backoff'           => 10,
+			'max_runtime'       => 0,
+			'batch_units'       => 1,
+			'batch_cost'        => 0,
+			'max_leased'        => 0,
+			'rate_limit'        => array(),
+			'priority'          => 0,
+			'on_failure'        => 'continue',
+			'finalize_attempts' => 5,
+			'keep_artifacts'    => false,
 		);
 		$options  = isset( $this->tasks[ $type ] ) ? array_merge( $defaults, $this->tasks[ $type ]->options() ) : $defaults;
 
@@ -129,6 +131,10 @@ final class Queue {
 					'units'   => max( 1, (int) $limit['units'] ),
 					'seconds' => max( 1, (int) ( $limit['seconds'] ?? 60 ) ),
 				);
+			case 'finalize_attempts':
+				return max( 1, min( 50, (int) $options['finalize_attempts'] ) );
+			case 'keep_artifacts':
+				return ! empty( $options['keep_artifacts'] );
 			case 'on_failure':
 				return 'fail_job' === $options['on_failure'] ? 'fail_job' : 'continue';
 		}
@@ -1143,7 +1149,8 @@ final class Queue {
 
 	/**
 	 * Finalizes a job when none of its units is waiting: plans the next stage, or applies the outcome. The
-	 * finalization is claimed once; when it throws or the request dies, it is retried later.
+	 * finalization is claimed once; when it throws or the request dies, it is retried later, and after
+	 * `finalize_attempts` throws the job fails (it would otherwise stay in `finalizing` for ever).
 	 */
 	public function maybe_finalize( int $job_id ) {
 		global $wpdb;
@@ -1190,15 +1197,14 @@ final class Queue {
 			}
 			$result = $task->finalize( json_decode( $job->input, true ), new Outputs( $this->schema, $job_id ), $job_id );
 		} catch ( \Throwable $error ) {
-			// Temporary problem: try again later (recover() picks it up after the timeout).
-			$wpdb->update(
-				$this->schema->jobs,
-				array(
-					'error'      => substr( $error->getMessage(), 0, 500 ),
-					'updated_at' => self::now(),
-				),
-				array( 'id' => $job_id )
-			);
+			// Perhaps a temporary problem: try again later (recover() picks it up after the timeout), but not
+			// for ever: a job that never leaves `finalizing` keeps its group open and cannot be retried.
+			$message = substr( $error->getMessage(), 0, 500 );
+			$wpdb->query( $wpdb->prepare( "UPDATE {$this->schema->jobs} SET finalize_tries = finalize_tries + 1, error = %s, updated_at = %s WHERE id = %d", $message, self::now(), $job_id ) );
+			$tries = (int) $wpdb->get_var( $wpdb->prepare( "SELECT finalize_tries FROM {$this->schema->jobs} WHERE id = %d", $job_id ) );
+			if ( $tries >= $this->option( $job->type, 'finalize_attempts' ) ) {
+				$this->fail_job( $job_id, $message, array( self::FINALIZING ) );
+			}
 			return;
 		} finally {
 			if ( $switch ) {
@@ -1217,11 +1223,19 @@ final class Queue {
 			return;
 		}
 
-		$done = $wpdb->query( $wpdb->prepare( "UPDATE {$this->schema->jobs} SET state = 'completed', result = %s, error = NULL, finished_at = %s, updated_at = %s WHERE id = %d AND state = 'finalizing'", $json, self::now(), self::now(), $job_id ) );
+		$done = $wpdb->query( $wpdb->prepare( "UPDATE {$this->schema->jobs} SET state = 'completed', finalize_tries = 0, result = %s, error = NULL, finished_at = %s, updated_at = %s WHERE id = %d AND state = 'finalizing'", $json, self::now(), self::now(), $job_id ) );
 
 		if ( $done ) {
 			$this->emit( 'job_completed', $job_id, $job->type, $result );
 			$this->release_dependents( $job_id );
+
+			// The outputs are applied: the staged files are no longer needed, unless failed units may still be
+			// retried (their finalization reads the files of the units that completed).
+			$failed = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$this->schema->units} WHERE job_id = %d AND state = 'failed'", $job_id ) );
+			if ( ! $failed && ! $this->option( $job->type, 'keep_artifacts' ) ) {
+				$this->storage->delete_job( $job_id );
+				$wpdb->delete( $this->schema->artifacts, array( 'job_id' => $job_id ) );
+			}
 		}
 	}
 
@@ -1389,7 +1403,7 @@ final class Queue {
 		$states = array(
 			'pause'  => array( self::ACTIVE ),
 			'resume' => array( self::PAUSED ),
-			'cancel' => array( self::ACTIVE, self::PAUSED, self::WAITING ),
+			'cancel' => array( self::ACTIVE, self::PAUSED, self::WAITING, self::FINALIZING ),
 			'retry'  => array( self::FAILED, self::COMPLETED ),
 		);
 		if ( ! isset( $states[ $action ] ) || '' === $group ) {
@@ -1401,6 +1415,7 @@ final class Queue {
 		$changed = 0;
 
 		// A job whose dependency was just cancelled has failed with it: control() refuses it, which is fine.
+		// So is the refusal of a finalization that may still be running.
 		foreach ( array_map( 'intval', (array) $ids ) as $job_id ) {
 			if ( ! is_wp_error( $this->control( $job_id, $action ) ) ) {
 				++$changed;
@@ -1450,7 +1465,8 @@ final class Queue {
 				$changed = $wpdb->query( $wpdb->prepare( "UPDATE $jobs SET state = 'active', updated_at = %s WHERE id = %d AND state = 'paused'", $now, $job_id ) );
 				break;
 			case 'cancel':
-				$changed = $wpdb->query( $wpdb->prepare( "UPDATE $jobs SET state = 'cancelled', finished_at = %s, updated_at = %s WHERE id = %d AND state IN ('active','paused','waiting')", $now, $now, $job_id ) );
+				// A finalization updated within the timeout may still be running; an older one is stuck.
+				$changed = $wpdb->query( $wpdb->prepare( "UPDATE $jobs SET state = 'cancelled', finished_at = %s, updated_at = %s WHERE id = %d AND ( state IN ('active','paused','waiting') OR ( state = 'finalizing' AND updated_at < %s ) )", $now, $now, $job_id, self::now( -self::FINALIZE_TIMEOUT ) ) );
 				if ( $changed ) {
 					$this->emit( 'job_cancelled', $job_id, (string) $wpdb->get_var( $wpdb->prepare( "SELECT type FROM $jobs WHERE id = %d", $job_id ) ) );
 					$this->release_dependents( $job_id );
@@ -1459,7 +1475,7 @@ final class Queue {
 			case 'retry':
 				// The failed units run again; a failed job without failed units (its finalization failed) is
 				// finalized again.
-				$changed = $wpdb->query( $wpdb->prepare( "UPDATE $jobs SET state = 'active', result = NULL, error = NULL, finished_at = NULL, updated_at = %s WHERE id = %d AND ( state = 'failed' OR ( state = 'completed' AND EXISTS ( SELECT 1 FROM {$this->schema->units} u WHERE u.job_id = %d AND u.state = 'failed' ) ) )", $now, $job_id, $job_id ) );
+				$changed = $wpdb->query( $wpdb->prepare( "UPDATE $jobs SET state = 'active', finalize_tries = 0, result = NULL, error = NULL, finished_at = NULL, updated_at = %s WHERE id = %d AND ( state = 'failed' OR ( state = 'completed' AND EXISTS ( SELECT 1 FROM {$this->schema->units} u WHERE u.job_id = %d AND u.state = 'failed' ) ) )", $now, $job_id, $job_id ) );
 				if ( $changed ) {
 					$wpdb->query( $wpdb->prepare( "UPDATE {$this->schema->units} SET state = 'pending', attempts = 0, error = NULL, available_at = NULL, finished_at = NULL, updated_at = %s WHERE job_id = %d AND state = 'failed'", $now, $job_id ) );
 				}
@@ -1480,13 +1496,24 @@ final class Queue {
 		return array( 'state' => $job ? $job['state'] : '' );
 	}
 
-	/** Counts the work a browser could start now, cheaply (polled by idle tabs). */
-	public function waiting(): int {
+	/**
+	 * Counts the work a browser could start now, cheaply (polled by idle tabs). With `$types`, only the work of
+	 * those task types: a tab whose worker runs some types is not woken for the others.
+	 */
+	public function waiting( array $types = array() ): int {
 		global $wpdb;
 
 		$now    = self::now();
 		$paused = $this->paused_types();
 		$skip   = $paused ? " AND j.type NOT IN ('" . implode( "','", array_map( 'esc_sql', $paused ) ) . "')" : '';
+
+		if ( $types ) {
+			$types = array_values( array_intersect( $this->types(), $types ) );
+			if ( ! $types ) {
+				return 0;
+			}
+			$skip .= " AND j.type IN ('" . implode( "','", array_map( 'esc_sql', $types ) ) . "')";
+		}
 
 		$units = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$this->schema->units} u JOIN {$this->schema->jobs} j ON j.id = u.job_id WHERE j.state = 'active' AND ( j.run_at IS NULL OR j.run_at <= %s )$skip AND ( ( u.state = 'pending' AND ( u.available_at IS NULL OR u.available_at <= %s ) ) OR ( u.state = 'leased' AND u.lease_expires < %s ) )", $now, $now, $now ) );
 		$plans = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$this->schema->jobs} j WHERE j.state = 'active' AND j.planned = 0$skip" );

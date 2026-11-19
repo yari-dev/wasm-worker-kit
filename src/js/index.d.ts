@@ -107,7 +107,7 @@ export interface WorkerController {
 
 export function isSupported(): boolean;
 export function startWorkers( options: WorkerOptions ): WorkerController;
-export function watchQueue( options: WorkerOptions & { interval?: number } ): { stop(): void; workers: WorkerController };
+export function watchQueue( options: WorkerOptions & { interval?: number; types?: string[] } ): { stop(): void; workers: WorkerController };
 export function createDirectWorker( options: Omit<WorkerOptions, 'concurrency' | 'stopWhenIdle'> ): {
 	/** Runs inputs right away, outside of the queue; one outcome per input. */
 	run<Result = unknown>( type: string, inputs: unknown[] ): Promise<Outcome<Result>[]>;

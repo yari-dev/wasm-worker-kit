@@ -189,6 +189,53 @@ if ( $cu ) {
 	expect( empty( $late[0]['accepted'] ), 'cancelled job rejects late results' );
 }
 
+// A finalization that keeps throwing fails the job; a fresh one cannot be cancelled, a failed one can be retried.
+$stuck = $a->enqueue( 'add', array( 'n' => 1 ) );
+$sc    = $q->claim( $admin, array( 'add' ) );
+$done  = array();
+foreach ( $sc['units'] as $u ) {
+	if ( $u['job_id'] !== $stuck ) {
+		continue; // A unit of an earlier job in the same batch: its finalization would use up the flag.
+	}
+	$done[] = array( 'unit_id' => $u['id'], 'epoch' => $u['epoch'], 'completion_id' => 'stuck-' . $u['id'] . '-x', 'result' => 10 + (int) substr( $u['key'], 1 ) );
+}
+KitTestA\Add::$fail_finalize = true;
+$q->complete( $admin, $sc['lease'], $done );
+expect( 'finalizing' === $a->job( $stuck )['state'], 'a finalization that threw waits' );
+expect( is_wp_error( $a->control( $stuck, 'cancel' ) ), 'a fresh finalizing job cannot be cancelled' );
+for ( $i = 0; $i < 3; $i++ ) {
+	KitTestA\Add::$fail_finalize = true;
+	$wpdb->update( $jobs, array( 'updated_at' => gmdate( 'Y-m-d H:i:s', time() - 600 ) ), array( 'id' => $stuck ) );
+	$q->recover();
+}
+expect( 'finalizing' === $a->job( $stuck )['state'], 'four failed finalizations: still retried' );
+KitTestA\Add::$fail_finalize = true;
+$wpdb->update( $jobs, array( 'updated_at' => gmdate( 'Y-m-d H:i:s', time() - 600 ) ), array( 'id' => $stuck ) );
+$q->recover();
+$failed = $a->job( $stuck );
+expect( 'failed' === $failed['state'], 'the fifth failed finalization fails the job' );
+expect( '' !== (string) $failed['error'], 'the failed job keeps the error' );
+$applied = KitTestA\Add::$finalized;
+expect( ! is_wp_error( $a->control( $stuck, 'retry' ) ), 'a job failed by its finalization can be retried' );
+expect( 'completed' === $a->job( $stuck )['state'] && $applied + 1 === KitTestA\Add::$finalized, 'the retry finalizes it' );
+expect( 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT finalize_tries FROM $jobs WHERE id = %d", $stuck ) ), 'the retry starts counting again' ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+// A job stuck in finalizing past the timeout can be cancelled.
+$stale = $a->enqueue( 'add', array( 'n' => 1 ) );
+$sc    = $q->claim( $admin, array( 'add' ) );
+$done  = array();
+foreach ( $sc['units'] as $u ) {
+	if ( $u['job_id'] !== $stale ) {
+		continue; // A unit of an earlier job in the same batch: its finalization would use up the flag.
+	}
+	$done[] = array( 'unit_id' => $u['id'], 'epoch' => $u['epoch'], 'completion_id' => 'stale-' . $u['id'] . '-x', 'result' => 10 + (int) substr( $u['key'], 1 ) );
+}
+KitTestA\Add::$fail_finalize = true;
+$q->complete( $admin, $sc['lease'], $done );
+$wpdb->update( $jobs, array( 'updated_at' => gmdate( 'Y-m-d H:i:s', time() - 600 ) ), array( 'id' => $stale ) );
+expect( ! is_wp_error( $a->control( $stale, 'cancel' ) ), 'a stale finalizing job can be cancelled' );
+expect( 'cancelled' === $a->job( $stale )['state'], 'and is cancelled' );
+
 // Rerun with a key.
 expect( $a->enqueue( 'add', array( 'n' => 5 ), array( 'key' => 'job-1', 'rerun' => true ) ) === $job, 'rerun does not apply to a job still active' );
 
@@ -425,6 +472,55 @@ $res = rest_do_request( $req );
 expect( 200 === $res->get_status() && count( $ra['units'] ) === count( $res->get_data()['released'] ?? array() ), 'release: REST route' );
 expect( 409 === rest_do_request( $req )->get_status(), 'release: REST route answers 409 for a stale lease' );
 $r->uninstall();
+
+// Staged files go when their job completes without failed units, and stay while a failed unit may be retried.
+$a_artifacts = str_replace( '_units', '_artifacts', $units );
+$staged      = function ( int $n ) use ( $a, $q, $admin, $wpdb, $a_artifacts ) {
+	$id    = $a->enqueue( 'add', array( 'n' => $n ) );
+	$lease = $q->claim( $admin, array( 'add' ) );
+	$mine  = array_values( array_filter( $lease['units'], fn( $u ) => $u['job_id'] === $id ) );
+	$file  = wp_tempnam( 'kit' );
+	file_put_contents( $file, 'staged' );
+	$q->attach( $admin, $lease['lease'], $mine[0]['id'], $mine[0]['epoch'], 'out.bin', $file, hash_file( 'sha256', $file ), 'application/octet-stream' );
+	$path = (string) $wpdb->get_var( $wpdb->prepare( "SELECT path FROM $a_artifacts WHERE job_id = %d", $id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+	return array( $id, $lease, $mine, $path );
+};
+
+list( $kept_job, $lease, $mine, $path ) = $staged( 1 );
+expect( '' !== $path && is_file( $path ), 'the upload is staged' );
+$q->complete( $admin, $lease['lease'], array( array( 'unit_id' => $mine[0]['id'], 'epoch' => $mine[0]['epoch'], 'completion_id' => 'staged-' . $mine[0]['id'] . '-x', 'result' => 10 ) ) );
+expect( 'completed' === $a->job( $kept_job )['state'], 'the job with a staged file completes' );
+expect( 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $a_artifacts WHERE job_id = %d", $kept_job ) ), 'completed: no artifact rows left' ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+expect( ! is_file( $path ) && ! is_dir( dirname( $path, 2 ) ), 'completed: the staged files are deleted' );
+
+list( $half_job, $lease, $mine, $path ) = $staged( 2 );
+$q->complete( $admin, $lease['lease'], array( array( 'unit_id' => $mine[0]['id'], 'epoch' => $mine[0]['epoch'], 'completion_id' => 'half-' . $mine[0]['id'] . '-x', 'result' => 10 ) ) );
+$q->fail( $admin, $lease['lease'], $mine[1]['id'], $mine[1]['epoch'], 'broken' );
+$again = $q->claim( $admin, array( 'add' ) );
+foreach ( $again['units'] as $u ) {
+	if ( $u['job_id'] === $half_job ) {
+		$q->fail( $admin, $again['lease'], $u['id'], $u['epoch'], 'broken' );
+	}
+}
+expect( 'completed' === $a->job( $half_job )['state'] && 1 === $a->job( $half_job )['units']['failed'], 'a job completes with a failed unit' );
+expect( is_file( $path ), 'a failed unit may be retried: the staged files are kept' );
+
+// Waiting work can be counted for given task types (a helper whose worker runs only some of them).
+$typed = $a->enqueue( 'add', array( 'n' => 1 ) );
+expect( $q->waiting( array( 'add' ) ) >= 1, 'waiting: the work of a type is counted' );
+expect( $q->waiting( array( 'strict' ) ) === $q->waiting() - $q->waiting( array( 'add' ) ), 'waiting: the registered types add up to the total' );
+expect( 0 === $q->waiting( array( 'no-such-type' ) ), 'waiting: an unknown type has no work' );
+expect( $q->waiting() >= $q->waiting( array( 'add' ) ), 'waiting: without types, everything is counted' );
+( new KitTestA\Worker\Rest( $a ) )->register(); // Kit A was not booted: its routes are added here.
+$req = new WP_REST_Request( 'GET', '/' . $a->rest_namespace() . '/waiting' );
+$req->set_query_params( array( 'types' => array( 'add' ) ) );
+$res = rest_do_request( $req );
+expect( 200 === $res->get_status() && $q->waiting( array( 'add' ) ) === ( $res->get_data()['waiting'] ?? null ), 'waiting: REST route with types' );
+$req->set_query_params( array( 'types' => array( 'no-such-type' ) ) );
+expect( 0 === ( rest_do_request( $req )->get_data()['waiting'] ?? null ), 'waiting: REST route, a type without work' );
+$req->set_query_params( array() );
+expect( $q->waiting() === ( rest_do_request( $req )->get_data()['waiting'] ?? null ), 'waiting: REST route without types' );
+$a->control( $typed, 'cancel' );
 
 // Scheduling, limits, dependencies, stages and monitoring.
 require __DIR__ . '/features.php';

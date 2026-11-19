@@ -146,6 +146,8 @@ generated and not committed), then install the `examples/demo-plugin` folder as 
 | `rate_limit` | none | `array( 'units' => 60, 'seconds' => 60 )`: units started per window, all workers together. |
 | `priority` | 0 | Default priority of the jobs of this type. |
 | `on_failure` | `continue` | `continue`: `finalize()` sees the failures. `fail_job`: the job fails at the first failed unit. |
+| `finalize_attempts` | 5 | A finalization that threw this many times fails the job. |
+| `keep_artifacts` | `false` | Keeps a job's staged files after it completed (until it is pruned). |
 
 `Outputs` gives `results()` and `completed()` (generators, memory-safe for large jobs; `completed()` gives each input with its result), `failures()`, `artifacts( $key )`, `data()` and `counts()`.
 
@@ -192,6 +194,7 @@ checkpoint, or null), `artifacts` (files kept by that checkpoint), `engine`, `si
 `checkpoint( data )`, `upload( key, data, type )`, `progress( fraction, text )`, `unit`, and the `env` fields:
 `fetch( url, init )` (fetch with the worker's credentials, for the plugin's own REST routes), `report( state,
 data )` (a custom status for the page, e.g. a download) and `options` (the host's `workerOptions`).
+`upload()` retries network and server errors (4 attempts).
 
 `runBatch( ctx )` replaces `run()` for engines that are faster on batches (ML inference): `ctx.units` is a list
 of `{ input, unit, attempt }`, and it returns one outcome per unit, in order: `{ result }` or `{ error, retry }`.
@@ -206,7 +209,8 @@ of `{ input, unit, attempt }`, and it returns one outcome per unit, in order: `{
 
 `startWorkers( options )` runs workers in this tab while a page is open (`concurrency`, `stopWhenIdle`,
 `onStatus`, `workerType` (`module` or `classic`, for a bundled worker using `importScripts()`), `workerOptions`);
-`watchQueue( options )` starts them only when there is waiting work. One tab per browser works for a plugin
+`watchQueue( options )` starts them only when there is waiting work. Pass `types` (the task types its worker
+file serves) so that work for other types does not wake it. One tab per browser works for a plugin
 at a time (Web Locks). `createDirectWorker( options ).run( type, inputs )` runs inputs right away with the same
 runners, outside of the queue (previews, interactive tools), and returns one outcome per input. Types are in
 `index.d.ts`.
@@ -306,7 +310,8 @@ Deliberately not included, because WordPress plugins cannot rely on it or do not
   your settings screen. Without it, the default uploads folder relies on an unguessable folder name, random
   file names without extension (never served as HTML or SVG), and deny files for Apache and IIS; nginx serves
   a file only to someone who already knows its full random URL, which is never sent out. That is fine for
-  outputs published anyway (optimized images), not for documents.
+  outputs published anyway (optimized images), not for documents. A job's staged files are deleted when it
+  completes without failed units (task option `keep_artifacts` keeps them until the job is pruned).
 
 ## Tests
 
@@ -317,7 +322,7 @@ wp eval-file tests/smoke.php /tmp/kit-a /tmp/kit-b
 npm test
 ```
 
-`smoke.php`: 118 checks of the PHP side (the lease fence and late writes, releases, uploads, checkpoints, planning,
+`smoke.php`: 141 checks of the PHP side (the lease fence and late writes, releases, uploads, checkpoints, planning,
 starvation, two kit copies side by side, scheduling, limits, dependencies, stages, groups, affinity, job data,
 finalization as the owner, repeatable jobs, metrics, events and uninstall). `npm test`: the browser runtime in
 Node against a fake server (both runner styles, affinity, statuses, credentials, direct runs, release on

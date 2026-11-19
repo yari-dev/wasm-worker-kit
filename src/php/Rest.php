@@ -72,7 +72,7 @@ final class Rest {
 			'/complete'   => array( 'POST', $worker, array( $this, 'complete' ), array( 'lease' => $lease, 'results' => array( 'type' => 'array', 'required' => true, 'maxItems' => 500 ) ) ),
 			'/fail'       => array( 'POST', $worker, array( $this, 'fail' ), $unit + array( 'lease' => $lease, 'error' => array( 'type' => 'string', 'default' => '' ), 'retry' => array( 'type' => 'boolean', 'default' => true ) ) ),
 			'/release'    => array( 'POST', $worker, array( $this, 'release' ), array( 'lease' => $lease, 'units' => array( 'type' => 'array', 'required' => true, 'maxItems' => 500 ) ) ),
-			'/waiting'    => array( 'GET', $worker, array( $this, 'waiting' ), array() ),
+			'/waiting'    => array( 'GET', $worker, array( $this, 'waiting' ), array( 'types' => array( 'type' => 'array', 'items' => array( 'type' => 'string' ), 'default' => array() ) ) ),
 			'/jobs'       => array( 'GET', $user, array( $this, 'jobs' ), array() ),
 			'/metrics'    => array( 'GET', $manage, array( $this, 'metrics' ), array() ),
 			'/workers'    => array( 'GET', $manage, array( $this, 'workers' ), array() ),
@@ -230,9 +230,10 @@ final class Rest {
 		return $this->kit->queue()->release( wp_get_current_user(), (string) $request['lease'], is_array( $request['units'] ) ? $request['units'] : array() );
 	}
 
-	/** Amount of waiting work. */
-	public function waiting() {
-		return array( 'waiting' => $this->kit->queue()->waiting() );
+	/** Amount of waiting work, of the given task types when the request names some. */
+	public function waiting( \WP_REST_Request $request ) {
+		$types = array_values( array_filter( (array) $request['types'], 'is_string' ) );
+		return array( 'waiting' => $this->kit->queue()->waiting( $types ) );
 	}
 
 	/* Jobs. */
